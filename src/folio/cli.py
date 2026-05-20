@@ -10,7 +10,7 @@ import sqlite3
 import subprocess
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import click
@@ -27,6 +27,7 @@ SCHEMA_MAP = {"v1": "folio.event.v1"}
 KEYRING_SERVICE = "folio-cli"
 KEYRING_ACCOUNT = "master-key-v1"
 PDF_MIME = "application/pdf"
+TMP_TTL_MINUTES = 10
 
 
 def utc_now_iso() -> str:
@@ -123,6 +124,11 @@ def encrypt_bytes(plaintext: bytes, key: bytes) -> tuple[bytes, bytes, bytes]:
     ciphertext = sealed[:-16]
     tag = sealed[-16:]
     return nonce, tag, ciphertext
+
+
+def decrypt_bytes(ciphertext: bytes, nonce: bytes, tag: bytes, key: bytes) -> bytes:
+    aes = AESGCM(key)
+    return aes.decrypt(nonce, ciphertext + tag, associated_data=None)
 
 
 def extract_text(path: Path, mime_type: str | None) -> tuple[str | None, str | None]:
@@ -311,6 +317,8 @@ def add(path: Path) -> None:
             ),
         )
         conn.commit()
+    except click.exceptions.Exit:
+        raise
     except RuntimeError as exc:
         conn.rollback()
         emit_error_and_exit(config, command, "KEYCHAIN_ERROR", f"Unable to access Keychain: {exc}")
@@ -398,9 +406,97 @@ def search(config: CliConfig, query: str, limit_: int) -> None:
 @main.command()
 @click.argument("doc_id", type=str)
 @click.option("--persist", is_flag=True, help="Persist decrypted file to exports.")
-def open(doc_id: str, persist: bool) -> None:
+@click.pass_obj
+def open(config: CliConfig, doc_id: str, persist: bool) -> None:
     """Open a document by ID."""
-    click.echo(f"open: not implemented (id={doc_id}, persist={persist})")
+    command = "open"
+    require_initialized(config, command)
+
+    db_path = folio_db_path()
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT original_name, stored_rel_path, encryption_nonce, encryption_tag
+            FROM documents
+            WHERE id = ?
+            """,
+            (doc_id,),
+        ).fetchone()
+        if row is None:
+            emit_error_and_exit(config, command, "NOT_FOUND", "Document id not found", id=doc_id)
+
+        original_name, stored_rel_path, nonce, tag = row
+        cipher_path = folio_root() / stored_rel_path
+        if not cipher_path.exists():
+            emit_error_and_exit(
+                config,
+                command,
+                "NOT_FOUND",
+                "Encrypted file not found for document id",
+                id=doc_id,
+                path=str(cipher_path),
+            )
+
+        key = get_or_create_master_key()
+        ciphertext = cipher_path.read_bytes()
+        plaintext = decrypt_bytes(ciphertext, nonce, tag, key)
+
+        name_suffix = Path(original_name).suffix
+        if persist:
+            out_dir = folio_root() / "exports"
+            out_path = out_dir / original_name
+            if out_path.exists():
+                stem = Path(original_name).stem
+                out_path = out_dir / f"{stem}-{doc_id[:8]}{name_suffix}"
+        else:
+            out_dir = folio_root() / "tmp"
+            out_path = out_dir / f"{doc_id}-{uuid.uuid4().hex[:8]}{name_suffix}"
+        out_path.write_bytes(plaintext)
+
+        if not persist:
+            created_at = utc_now_iso()
+            expires_at = (
+                datetime.now(UTC).replace(microsecond=0) + timedelta(minutes=TMP_TTL_MINUTES)
+            ).isoformat().replace("+00:00", "Z")
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO tmp_manifest (path, created_at, expires_at, pid)
+                VALUES (?, ?, ?, ?)
+                """,
+                (str(out_path), created_at, expires_at, os.getpid()),
+            )
+            conn.commit()
+    except click.exceptions.Exit:
+        raise
+    except RuntimeError as exc:
+        emit_error_and_exit(config, command, "KEYCHAIN_ERROR", f"Unable to access Keychain: {exc}")
+    except sqlite3.Error as exc:
+        conn.rollback()
+        emit_error_and_exit(config, command, "INDEX_ERROR", f"Failed to open document: {exc}", id=doc_id)
+    except Exception as exc:
+        emit_error_and_exit(config, command, "CRYPTO_ERROR", f"Failed to decrypt document: {exc}", id=doc_id)
+    finally:
+        conn.close()
+
+    opened = subprocess.run(["open", str(out_path)], capture_output=True, text=True, check=False)
+    if opened.returncode != 0:
+        stderr = opened.stderr.strip() or "open command failed"
+        emit_error_and_exit(config, command, "OPEN_FAILED", stderr, id=doc_id, path=str(out_path))
+
+    emit_event(
+        config,
+        command=command,
+        event="open.completed",
+        level="info",
+        data={
+            "id": doc_id,
+            "launched": True,
+            "persisted": persist,
+            "export_path": str(out_path) if persist else None,
+            "tmp_path": str(out_path) if not persist else None,
+        },
+    )
 
 
 @main.command()
