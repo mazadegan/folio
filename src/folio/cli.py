@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
+import mimetypes
+import os
+import shutil
 import sqlite3
+import subprocess
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 import click
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
 @dataclass(frozen=True)
@@ -16,6 +24,9 @@ class CliConfig:
 
 
 SCHEMA_MAP = {"v1": "folio.event.v1"}
+KEYRING_SERVICE = "folio-cli"
+KEYRING_ACCOUNT = "master-key-v1"
+PDF_MIME = "application/pdf"
 
 
 def utc_now_iso() -> str:
@@ -42,6 +53,101 @@ def emit_event(config: CliConfig, command: str, event: str, level: str, data: di
         click.echo(f"{event}: {data}")
         return
     click.echo(json.dumps(payload, separators=(",", ":")))
+
+
+def emit_error_and_exit(config: CliConfig, command: str, code: str, message: str, **extra: object) -> None:
+    payload: dict[str, object] = {"code": code, "message": message}
+    payload.update(extra)
+    emit_event(config, command=command, event="error", level="error", data=payload)
+    raise click.exceptions.Exit(1)
+
+
+def folio_root() -> Path:
+    return Path.home() / "Folio"
+
+
+def folio_db_path() -> Path:
+    return folio_root() / "index" / "folio.db"
+
+
+def require_initialized(config: CliConfig, command: str) -> None:
+    root = folio_root()
+    db = folio_db_path()
+    if not root.exists() or not db.exists():
+        emit_error_and_exit(config, command, "NOT_INITIALIZED", "Folio is not initialized. Run `folio init`.")
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def get_or_create_master_key() -> bytes:
+    security = shutil.which("security")
+    if security is None:
+        raise RuntimeError("macOS Keychain tool `security` not found in PATH.")
+
+    find_cmd = [security, "find-generic-password", "-a", KEYRING_ACCOUNT, "-s", KEYRING_SERVICE, "-w"]
+    found = subprocess.run(find_cmd, capture_output=True, text=True, check=False)
+    if found.returncode == 0:
+        return base64.urlsafe_b64decode(found.stdout.strip().encode("utf-8"))
+
+    key = os.urandom(32)
+    encoded = base64.urlsafe_b64encode(key).decode("utf-8")
+
+    add_cmd = [
+        security,
+        "add-generic-password",
+        "-U",
+        "-a",
+        KEYRING_ACCOUNT,
+        "-s",
+        KEYRING_SERVICE,
+        "-w",
+        encoded,
+    ]
+    added = subprocess.run(add_cmd, capture_output=True, text=True, check=False)
+    if added.returncode != 0:
+        stderr = added.stderr.strip() or "unknown keychain error"
+        raise RuntimeError(stderr)
+    return key
+
+
+def encrypt_bytes(plaintext: bytes, key: bytes) -> tuple[bytes, bytes, bytes]:
+    nonce = os.urandom(12)
+    aes = AESGCM(key)
+    sealed = aes.encrypt(nonce, plaintext, associated_data=None)
+    ciphertext = sealed[:-16]
+    tag = sealed[-16:]
+    return nonce, tag, ciphertext
+
+
+def extract_text(path: Path, mime_type: str | None) -> tuple[str | None, str | None]:
+    if mime_type == PDF_MIME or path.suffix.lower() == ".pdf":
+        pdftotext = shutil.which("pdftotext")
+        if pdftotext is None:
+            return None, "pdftotext is required for PDF files but was not found in PATH."
+        proc = subprocess.run(
+            [pdftotext, str(path), "-"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return None, "Failed to extract text from PDF with pdftotext."
+        return proc.stdout.strip(), None
+
+    is_text = (mime_type or "").startswith("text/") or path.suffix.lower() in {".txt", ".md", ".csv", ".json"}
+    if not is_text:
+        return None, None
+
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").strip(), None
+    except OSError:
+        return None, "Failed to read text content for indexing."
 
 
 def ensure_database(db_path: Path) -> None:
@@ -140,7 +246,98 @@ def init(config: CliConfig) -> None:
 @click.argument("path", type=click.Path(path_type=Path))
 def add(path: Path) -> None:
     """Add a document to Folio."""
-    click.echo(f"add: not implemented ({path})")
+    config = click.get_current_context().obj
+    assert isinstance(config, CliConfig)
+    command = "add"
+    require_initialized(config, command)
+
+    source = path.expanduser().resolve()
+    if not source.exists():
+        emit_error_and_exit(config, command, "NOT_FOUND", "Input path does not exist.", path=str(source))
+    if not source.is_file():
+        emit_error_and_exit(config, command, "INVALID_PATH", "Input path must be a file.", path=str(source))
+
+    digest = file_sha256(source)
+    now = utc_now_iso()
+    db_path = folio_db_path()
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute("SELECT id, original_name FROM documents WHERE sha256 = ?", (digest,)).fetchone()
+        if row:
+            emit_event(
+                config,
+                command=command,
+                event="add.duplicate",
+                level="info",
+                data={"id": row[0], "filename": row[1], "sha256": digest, "imported": False},
+            )
+            return
+
+        doc_id = str(uuid.uuid4())
+        stored_rel_path = Path("store") / f"{doc_id}.bin"
+        stored_abs_path = folio_root() / stored_rel_path
+        key = get_or_create_master_key()
+        nonce, tag, ciphertext = encrypt_bytes(source.read_bytes(), key)
+        stored_abs_path.write_bytes(ciphertext)
+
+        mime_type = mimetypes.guess_type(source.name)[0]
+        indexed_at: str | None = None
+        indexed = False
+        text_content, extraction_error = extract_text(source, mime_type)
+        if text_content:
+            conn.execute("INSERT INTO documents_fts (id, content) VALUES (?, ?)", (doc_id, text_content))
+            indexed_at = now
+            indexed = True
+
+        conn.execute(
+            """
+            INSERT INTO documents (
+                id, original_name, stored_rel_path, mime_type, size_bytes, sha256,
+                created_at, indexed_at, encryption_nonce, encryption_tag
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                doc_id,
+                source.name,
+                str(stored_rel_path),
+                mime_type,
+                source.stat().st_size,
+                digest,
+                now,
+                indexed_at,
+                nonce,
+                tag,
+            ),
+        )
+        conn.commit()
+    except RuntimeError as exc:
+        conn.rollback()
+        emit_error_and_exit(config, command, "KEYCHAIN_ERROR", f"Unable to access Keychain: {exc}")
+    except sqlite3.Error as exc:
+        conn.rollback()
+        emit_error_and_exit(config, command, "INDEX_ERROR", f"Database error while adding file: {exc}")
+    finally:
+        conn.close()
+
+    if extraction_error:
+        if source.suffix.lower() == ".pdf" and "required for PDF" in extraction_error:
+            emit_error_and_exit(config, command, "DEPENDENCY_MISSING", extraction_error)
+        emit_event(
+            config,
+            command=command,
+            event="add.indexing_warning",
+            level="warn",
+            data={"id": doc_id, "filename": source.name, "message": extraction_error},
+        )
+
+    emit_event(
+        config,
+        command=command,
+        event="add.completed",
+        level="info",
+        data={"id": doc_id, "filename": source.name, "sha256": digest, "indexed": indexed},
+    )
 
 
 @main.command()
