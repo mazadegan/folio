@@ -31,6 +31,7 @@ KEYRING_ACCOUNT = "master-key-v1"
 PDF_MIME = "application/pdf"
 TMP_TTL_MINUTES = 10
 KEY_EXPORT_KDF_ITERS = 600_000
+SWIFT_HELPER_REL = Path("helpers/keychain-helper")
 
 
 def utc_now_iso() -> str:
@@ -89,53 +90,101 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def get_or_create_master_key() -> bytes:
-    security = shutil.which("security")
-    if security is None:
-        raise RuntimeError("macOS Keychain tool `security` not found in PATH.")
+def helper_project_dir() -> Path:
+    # src/folio/cli.py -> repo root
+    return Path(__file__).resolve().parents[2] / SWIFT_HELPER_REL
 
-    find_cmd = [security, "find-generic-password", "-a", KEYRING_ACCOUNT, "-s", KEYRING_SERVICE, "-w"]
-    found = subprocess.run(find_cmd, capture_output=True, text=True, check=False)
-    if found.returncode == 0:
-        return base64.urlsafe_b64decode(found.stdout.strip().encode("utf-8"))
+
+def run_key_helper(args: list[str]) -> dict[str, object]:
+    project = helper_project_dir()
+    cmd = [
+        "swift",
+        "run",
+        "--package-path",
+        str(project),
+        "folio-keychain-helper",
+        *args,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    raw = (proc.stdout or "").strip().splitlines()
+    if not raw:
+        err = proc.stderr.strip()
+        raise RuntimeError(f"key helper failed with no output{': ' + err if err else ''}")
+    try:
+        payload = json.loads(raw[-1])
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid helper output: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("invalid helper output shape")
+    ok = bool(payload.get("ok", False))
+    if not ok:
+        msg = str(payload.get("message") or payload.get("code") or "key helper failed")
+        raise RuntimeError(msg)
+    return payload
+
+
+def require_biometric(prompt: str) -> None:
+    run_key_helper(["auth", prompt])
+
+
+def get_or_create_master_key() -> bytes:
+    helper_status: dict[str, object] | None = None
+    try:
+        helper_status = run_key_helper(["status"])
+        if bool(helper_status.get("key_present")):
+            return get_master_key(prompt=None)
+    except RuntimeError:
+        helper_status = None
+
+    legacy = try_get_master_key_legacy_cli()
+    if legacy is not None:
+        # Attempt one-way migration into strict biometry-backed helper storage.
+        set_master_key(legacy)
+        return legacy
 
     key = os.urandom(32)
-    encoded = base64.urlsafe_b64encode(key).decode("utf-8")
-
-    add_cmd = [
-        security,
-        "add-generic-password",
-        "-U",
-        "-a",
-        KEYRING_ACCOUNT,
-        "-s",
-        KEYRING_SERVICE,
-        "-w",
-        encoded,
-    ]
-    added = subprocess.run(add_cmd, capture_output=True, text=True, check=False)
-    if added.returncode != 0:
-        stderr = added.stderr.strip() or "unknown keychain error"
-        raise RuntimeError(stderr)
+    set_master_key(key)
     return key
 
 
-def get_master_key() -> bytes:
+def get_master_key(prompt: str | None = None) -> bytes:
+    status = run_key_helper(["status"])
+    if bool(status.get("key_present")):
+        payload = run_key_helper(["get", prompt or "Authenticate to access Folio key"])
+        data_b64 = payload.get("data_b64")
+        if isinstance(data_b64, str):
+            return base64.b64decode(data_b64.encode("ascii"))
+        raise RuntimeError("helper get succeeded without key payload")
+
+    # Legacy fallback only if helper storage is empty.
+    legacy = try_get_master_key_legacy_cli()
+    if legacy is not None:
+        return legacy
+    raise RuntimeError("master key not found in Keychain")
+
+
+def try_get_master_key_legacy_cli() -> bytes | None:
     security = shutil.which("security")
     if security is None:
-        raise RuntimeError("macOS Keychain tool `security` not found in PATH.")
+        return None
     find_cmd = [security, "find-generic-password", "-a", KEYRING_ACCOUNT, "-s", KEYRING_SERVICE, "-w"]
     found = subprocess.run(find_cmd, capture_output=True, text=True, check=False)
     if found.returncode != 0:
-        raise RuntimeError("master key not found in Keychain")
+        return None
     return base64.urlsafe_b64decode(found.stdout.strip().encode("utf-8"))
 
 
 def set_master_key(key: bytes) -> None:
+    encoded = base64.b64encode(key).decode("ascii")
+    run_key_helper(["set", encoded])
+    return
+
+
+def set_master_key_legacy(key: bytes) -> None:
     security = shutil.which("security")
     if security is None:
         raise RuntimeError("macOS Keychain tool `security` not found in PATH.")
-    encoded = base64.urlsafe_b64encode(key).decode("utf-8")
+    legacy = base64.urlsafe_b64encode(key).decode("utf-8")
     add_cmd = [
         security,
         "add-generic-password",
@@ -145,7 +194,7 @@ def set_master_key(key: bytes) -> None:
         "-s",
         KEYRING_SERVICE,
         "-w",
-        encoded,
+        legacy,
     ]
     added = subprocess.run(add_cmd, capture_output=True, text=True, check=False)
     if added.returncode != 0:
@@ -154,12 +203,12 @@ def set_master_key(key: bytes) -> None:
 
 
 def has_master_key() -> bool:
-    security = shutil.which("security")
-    if security is None:
-        return False
-    find_cmd = [security, "find-generic-password", "-a", KEYRING_ACCOUNT, "-s", KEYRING_SERVICE]
-    found = subprocess.run(find_cmd, capture_output=True, text=True, check=False)
-    return found.returncode == 0
+    try:
+        status = run_key_helper(["status"])
+        return bool(status.get("key_present"))
+    except RuntimeError:
+        pass
+    return try_get_master_key_legacy_cli() is not None
 
 
 def encrypt_bytes(plaintext: bytes, key: bytes) -> tuple[bytes, bytes, bytes]:
@@ -411,6 +460,11 @@ def search(config: CliConfig, query: str, limit_: int) -> None:
     """Search documents."""
     command = "search"
     require_initialized(config, command)
+    try:
+        require_biometric("Authenticate to search Folio documents")
+        _ = get_master_key(prompt="Authenticate to access Folio key")
+    except RuntimeError as exc:
+        emit_error_and_exit(config, command, "KEYCHAIN_ERROR", f"Unable to access Keychain: {exc}")
 
     db_path = folio_db_path()
     conn = sqlite3.connect(db_path)
@@ -493,7 +547,8 @@ def open(config: CliConfig, doc_id: str, persist: bool) -> None:
                 path=str(cipher_path),
             )
 
-        key = get_or_create_master_key()
+        require_biometric("Authenticate to open Folio document")
+        key = get_master_key(prompt="Authenticate to access Folio key")
         ciphertext = cipher_path.read_bytes()
         plaintext = decrypt_bytes(ciphertext, nonce, tag, key)
 
@@ -570,6 +625,13 @@ def key_group() -> None:
 def key_status(config: CliConfig) -> None:
     command = "key.status"
     initialized = folio_root().exists() and folio_db_path().exists()
+    key_present = has_master_key()
+    biometric_capable = False
+    try:
+        status = run_key_helper(["status"])
+        biometric_capable = bool(status.get("biometric_capable", False))
+    except RuntimeError:
+        biometric_capable = False
     emit_event(
         config,
         command=command,
@@ -577,9 +639,9 @@ def key_status(config: CliConfig) -> None:
         level="info",
         data={
             "initialized": initialized,
-            "key_present": has_master_key(),
-            "biometric_enforced": False,
-            "warning": "Biometric enforcement is not yet enabled for the current Keychain item.",
+            "key_present": key_present,
+            "biometric_capable": biometric_capable,
+            "biometric_enforced": bool(key_present and biometric_capable),
         },
     )
 
@@ -663,6 +725,12 @@ def doctor(config: CliConfig) -> None:
     command = "doctor"
     initialized = folio_root().exists() and folio_db_path().exists()
     key_present = has_master_key()
+    biometric_capable = False
+    try:
+        status = run_key_helper(["status"])
+        biometric_capable = bool(status.get("biometric_capable", False))
+    except RuntimeError:
+        biometric_capable = False
     key_readable = False
     if key_present:
         try:
@@ -681,11 +749,9 @@ def doctor(config: CliConfig) -> None:
             "initialized": initialized,
             "key_present": key_present,
             "key_readable": key_readable,
-            "biometric_enforced": False,
-            "notes": [
-                "Use `folio key export <path>` to create an encrypted recovery backup.",
-                "Biometric keychain enforcement is not enabled yet and requires native Security API integration.",
-            ],
+            "biometric_capable": biometric_capable,
+            "biometric_enforced": bool(key_present and biometric_capable),
+            "notes": ["Use `folio key export <path>` to create an encrypted recovery backup."],
         },
     )
 

@@ -34,3 +34,7 @@ htmlcov/
 .vscode/
 .idea/
 
+# SwiftPM
+.build/
+.swiftpm/
+Package.resolved
