@@ -15,6 +15,8 @@ from pathlib import Path
 
 import click
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 
 @dataclass(frozen=True)
@@ -28,6 +30,7 @@ KEYRING_SERVICE = "folio-cli"
 KEYRING_ACCOUNT = "master-key-v1"
 PDF_MIME = "application/pdf"
 TMP_TTL_MINUTES = 10
+KEY_EXPORT_KDF_ITERS = 600_000
 
 
 def utc_now_iso() -> str:
@@ -117,6 +120,48 @@ def get_or_create_master_key() -> bytes:
     return key
 
 
+def get_master_key() -> bytes:
+    security = shutil.which("security")
+    if security is None:
+        raise RuntimeError("macOS Keychain tool `security` not found in PATH.")
+    find_cmd = [security, "find-generic-password", "-a", KEYRING_ACCOUNT, "-s", KEYRING_SERVICE, "-w"]
+    found = subprocess.run(find_cmd, capture_output=True, text=True, check=False)
+    if found.returncode != 0:
+        raise RuntimeError("master key not found in Keychain")
+    return base64.urlsafe_b64decode(found.stdout.strip().encode("utf-8"))
+
+
+def set_master_key(key: bytes) -> None:
+    security = shutil.which("security")
+    if security is None:
+        raise RuntimeError("macOS Keychain tool `security` not found in PATH.")
+    encoded = base64.urlsafe_b64encode(key).decode("utf-8")
+    add_cmd = [
+        security,
+        "add-generic-password",
+        "-U",
+        "-a",
+        KEYRING_ACCOUNT,
+        "-s",
+        KEYRING_SERVICE,
+        "-w",
+        encoded,
+    ]
+    added = subprocess.run(add_cmd, capture_output=True, text=True, check=False)
+    if added.returncode != 0:
+        stderr = added.stderr.strip() or "unknown keychain error"
+        raise RuntimeError(stderr)
+
+
+def has_master_key() -> bool:
+    security = shutil.which("security")
+    if security is None:
+        return False
+    find_cmd = [security, "find-generic-password", "-a", KEYRING_ACCOUNT, "-s", KEYRING_SERVICE]
+    found = subprocess.run(find_cmd, capture_output=True, text=True, check=False)
+    return found.returncode == 0
+
+
 def encrypt_bytes(plaintext: bytes, key: bytes) -> tuple[bytes, bytes, bytes]:
     nonce = os.urandom(12)
     aes = AESGCM(key)
@@ -129,6 +174,16 @@ def encrypt_bytes(plaintext: bytes, key: bytes) -> tuple[bytes, bytes, bytes]:
 def decrypt_bytes(ciphertext: bytes, nonce: bytes, tag: bytes, key: bytes) -> bytes:
     aes = AESGCM(key)
     return aes.decrypt(nonce, ciphertext + tag, associated_data=None)
+
+
+def derive_wrapping_key(passphrase: str, salt: bytes) -> bytes:
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=KEY_EXPORT_KDF_ITERS,
+    )
+    return kdf.derive(passphrase.encode("utf-8"))
 
 
 def extract_text(path: Path, mime_type: str | None) -> tuple[str | None, str | None]:
@@ -503,6 +558,136 @@ def open(config: CliConfig, doc_id: str, persist: bool) -> None:
 def sync() -> None:
     """Sync documents to remote provider."""
     click.echo("sync: not implemented")
+
+
+@main.group("key")
+def key_group() -> None:
+    """Manage Folio master key and recovery."""
+
+
+@key_group.command("status")
+@click.pass_obj
+def key_status(config: CliConfig) -> None:
+    command = "key.status"
+    initialized = folio_root().exists() and folio_db_path().exists()
+    emit_event(
+        config,
+        command=command,
+        event="key.status",
+        level="info",
+        data={
+            "initialized": initialized,
+            "key_present": has_master_key(),
+            "biometric_enforced": False,
+            "warning": "Biometric enforcement is not yet enabled for the current Keychain item.",
+        },
+    )
+
+
+@key_group.command("export")
+@click.argument("path", type=click.Path(path_type=Path))
+@click.pass_obj
+def key_export(config: CliConfig, path: Path) -> None:
+    command = "key.export"
+    require_initialized(config, command)
+    try:
+        master_key = get_master_key()
+    except RuntimeError as exc:
+        emit_error_and_exit(config, command, "KEYCHAIN_ERROR", f"Unable to read Keychain key: {exc}")
+
+    passphrase = click.prompt("Export passphrase", hide_input=True, confirmation_prompt=True)
+    salt = os.urandom(16)
+    wrap_key = derive_wrapping_key(passphrase, salt)
+    nonce, tag, ciphertext = encrypt_bytes(master_key, wrap_key)
+    payload = {
+        "format": "folio-master-key-backup-v1",
+        "kdf": "pbkdf2-sha256",
+        "iterations": KEY_EXPORT_KDF_ITERS,
+        "salt_b64": base64.b64encode(salt).decode("ascii"),
+        "nonce_b64": base64.b64encode(nonce).decode("ascii"),
+        "tag_b64": base64.b64encode(tag).decode("ascii"),
+        "ciphertext_b64": base64.b64encode(ciphertext).decode("ascii"),
+        "created_at": utc_now_iso(),
+    }
+
+    export_path = path.expanduser().resolve()
+    export_path.parent.mkdir(parents=True, exist_ok=True)
+    export_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    os.chmod(export_path, 0o600)
+    emit_event(config, command=command, event="key.exported", level="info", data={"path": str(export_path)})
+
+
+@key_group.command("import")
+@click.argument("path", type=click.Path(exists=True, path_type=Path))
+@click.option("--force", is_flag=True, help="Overwrite existing keychain key.")
+@click.pass_obj
+def key_import(config: CliConfig, path: Path, force: bool) -> None:
+    command = "key.import"
+    require_initialized(config, command)
+    if has_master_key() and not force:
+        emit_error_and_exit(config, command, "KEY_EXISTS", "Master key already exists. Use --force to replace it.")
+
+    raw = path.expanduser().resolve().read_text(encoding="utf-8")
+    try:
+        payload = json.loads(raw)
+        if payload.get("format") != "folio-master-key-backup-v1":
+            raise ValueError("unsupported backup format")
+        salt = base64.b64decode(payload["salt_b64"])
+        nonce = base64.b64decode(payload["nonce_b64"])
+        tag = base64.b64decode(payload["tag_b64"])
+        ciphertext = base64.b64decode(payload["ciphertext_b64"])
+    except Exception as exc:
+        emit_error_and_exit(config, command, "INVALID_BACKUP", f"Invalid backup file: {exc}")
+
+    passphrase = click.prompt("Import passphrase", hide_input=True)
+    try:
+        wrap_key = derive_wrapping_key(passphrase, salt)
+        master_key = decrypt_bytes(ciphertext, nonce, tag, wrap_key)
+        set_master_key(master_key)
+    except Exception as exc:
+        emit_error_and_exit(config, command, "IMPORT_FAILED", f"Unable to import key: {exc}")
+
+    emit_event(
+        config,
+        command=command,
+        event="key.imported",
+        level="info",
+        data={"path": str(path.expanduser().resolve()), "replaced": force},
+    )
+
+
+@main.command()
+@click.pass_obj
+def doctor(config: CliConfig) -> None:
+    """Run diagnostics for initialization and key health."""
+    command = "doctor"
+    initialized = folio_root().exists() and folio_db_path().exists()
+    key_present = has_master_key()
+    key_readable = False
+    if key_present:
+        try:
+            _ = get_master_key()
+            key_readable = True
+        except RuntimeError:
+            key_readable = False
+
+    level = "info" if initialized and key_present and key_readable else "warn"
+    emit_event(
+        config,
+        command=command,
+        event="doctor.completed",
+        level=level,
+        data={
+            "initialized": initialized,
+            "key_present": key_present,
+            "key_readable": key_readable,
+            "biometric_enforced": False,
+            "notes": [
+                "Use `folio key export <path>` to create an encrypted recovery backup.",
+                "Biometric keychain enforcement is not enabled yet and requires native Security API integration.",
+            ],
+        },
+    )
 
 
 if __name__ == "__main__":
