@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "init.completed",
+  "type": "object",
+  "required": ["event", "command", "data"],
+  "properties": {
+    "event": { "const": "init.completed" },
+    "command": { "const": "init" },
+    "data": {
+      "type": "object",
+      "required": ["folio_root", "created"],
+      "properties": {
+        "folio_root": { "type": "string", "minLength": 1 },
+        "created": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}
+

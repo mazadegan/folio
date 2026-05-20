@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Folio Event Envelope v1",
+  "type": "object",
+  "required": ["schema", "event_version", "event", "ts", "level", "command", "data"],
+  "properties": {
+    "schema": { "const": "folio.event.v1" },
+    "event_version": { "const": 1 },
+    "event": { "type": "string", "minLength": 1 },
+    "ts": { "type": "string", "minLength": 1 },
+    "level": { "type": "string", "enum": ["info", "warn", "error"] },
+    "command": { "type": "string", "minLength": 1 },
+    "data": { "type": "object" }
+  },
+  "additionalProperties": true
+}
+

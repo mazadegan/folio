@@ -1,25 +1,30 @@
-# Folio
+# Folio CLI
 
-A local-first document vault for macOS.
+Local-first document vault CLI for macOS.
 
-Folio lives in your menu bar and quietly indexes, encrypts, and organizes your documents for fast keyword and semantic search.
+## Setup
 
-## Features
+1. Create/activate your virtualenv.
+2. Install editable package:
+   - `pip install -e '.[dev]'`
+3. Build the macOS keychain helper:
+   - `swift build --package-path helpers/keychain-helper`
 
-- Drag-and-drop document ingestion
-- OCR for scanned PDFs
-- Local full-text + semantic search
-- Encrypted local storage
-- Google Drive backup/sync
-- Menu bar access
-- Offline-first
+## Commands
 
-## Philosophy
+- `folio init`
+- `folio add <path>`
+- `folio search "<query>" [--limit N]`
+- `folio open <id> [--persist]`
+- `folio sync` (placeholder)
 
-Your documents stay yours.
+## Output
 
-Folio stores documents locally, encrypts them before backup, and avoids centralized cloud storage whenever possible.
+- Default output is JSONL events (`schema=folio.event.v1`).
+- Use `--human` for human-readable output.
 
-## Status
+## Security
 
-Early development.
+- Files are encrypted at rest.
+- `search` and `open` require biometric auth via the native helper.
+- Canceling auth returns `error` with `code=AUTH_CANCELED`.

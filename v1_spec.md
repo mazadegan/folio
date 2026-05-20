@@ -278,6 +278,7 @@ Each line SHOULD include:
 - `tmp.cleanup_warning` (non-fatal cleanup failure)
 - `sync.not_implemented`
 - `error` (fatal; command exits non-zero)
+- `error` with `code=AUTH_CANCELED` for user-canceled biometric auth
 
 ### Example Events
 
