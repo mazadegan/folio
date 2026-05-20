@@ -342,9 +342,57 @@ def add(path: Path) -> None:
 
 @main.command()
 @click.argument("query", type=str)
-def search(query: str) -> None:
+@click.option("--limit", "limit_", default=10, show_default=True, type=click.IntRange(1, 1000))
+@click.pass_obj
+def search(config: CliConfig, query: str, limit_: int) -> None:
     """Search documents."""
-    click.echo(f"search: not implemented ({query})")
+    command = "search"
+    require_initialized(config, command)
+
+    db_path = folio_db_path()
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+                d.id,
+                d.original_name,
+                snippet(documents_fts, 1, '[', ']', '...', 12) AS snippet_text,
+                bm25(documents_fts) AS rank
+            FROM documents_fts
+            JOIN documents d ON d.id = documents_fts.id
+            WHERE documents_fts MATCH ?
+            ORDER BY rank
+            LIMIT ?
+            """,
+            (query, limit_),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        emit_error_and_exit(config, command, "INDEX_ERROR", f"Search query failed: {exc}")
+    finally:
+        conn.close()
+
+    for row in rows:
+        emit_event(
+            config,
+            command=command,
+            event="search.result",
+            level="info",
+            data={
+                "id": row[0],
+                "filename": row[1],
+                "snippet": row[2] or "",
+                "rank": row[3],
+            },
+        )
+
+    emit_event(
+        config,
+        command=command,
+        event="search.completed",
+        level="info",
+        data={"query": query, "count": len(rows), "limit": limit_},
+    )
 
 
 @main.command()
