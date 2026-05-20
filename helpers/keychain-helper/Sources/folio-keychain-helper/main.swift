@@ -91,6 +91,9 @@ func authBiometric(prompt: String) {
     if ok {
         emit(Output(ok: true, code: nil, message: nil, data_b64: nil, key_present: nil, biometric_capable: nil), exitCode: 0)
     }
+    if let message, message.localizedCaseInsensitiveContains("canceled") || message.localizedCaseInsensitiveContains("cancelled") {
+        emit(Output(ok: false, code: "AUTH_CANCELED", message: message, data_b64: nil, key_present: nil, biometric_capable: nil), exitCode: 1)
+    }
     emit(Output(ok: false, code: "BIO_FAILED", message: message ?? "Biometric authentication failed", data_b64: nil, key_present: nil, biometric_capable: nil), exitCode: 1)
 }
 

@@ -124,7 +124,13 @@ def run_key_helper(args: list[str]) -> dict[str, object]:
 
 
 def require_biometric(prompt: str) -> None:
-    run_key_helper(["auth", prompt])
+    try:
+        run_key_helper(["auth", prompt])
+    except RuntimeError as exc:
+        msg = str(exc)
+        if "AUTH_CANCELED" in msg or "canceled" in msg.lower() or "cancelled" in msg.lower():
+            raise RuntimeError("AUTH_CANCELED: Authentication canceled.") from exc
+        raise
 
 
 def get_or_create_master_key() -> bytes:
@@ -464,6 +470,9 @@ def search(config: CliConfig, query: str, limit_: int) -> None:
         require_biometric("Authenticate to search Folio documents")
         _ = get_master_key(prompt="Authenticate to access Folio key")
     except RuntimeError as exc:
+        message = str(exc)
+        if "AUTH_CANCELED" in message:
+            emit_error_and_exit(config, command, "AUTH_CANCELED", "Authentication canceled.")
         emit_error_and_exit(config, command, "KEYCHAIN_ERROR", f"Unable to access Keychain: {exc}")
 
     db_path = folio_db_path()
@@ -580,6 +589,9 @@ def open(config: CliConfig, doc_id: str, persist: bool) -> None:
     except click.exceptions.Exit:
         raise
     except RuntimeError as exc:
+        message = str(exc)
+        if "AUTH_CANCELED" in message:
+            emit_error_and_exit(config, command, "AUTH_CANCELED", "Authentication canceled.", id=doc_id)
         emit_error_and_exit(config, command, "KEYCHAIN_ERROR", f"Unable to access Keychain: {exc}")
     except sqlite3.Error as exc:
         conn.rollback()
