@@ -38,3 +38,7 @@ htmlcov/
 .build/
 .swiftpm/
 Package.resolved
+
+# Tauri / Rust
+gui/FolioTauri/node_modules/
+gui/FolioTauri/src-tauri/target/

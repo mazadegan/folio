@@ -1,0 +1,37 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Folio",
+  "version": "0.1.0",
+  "identifier": "com.malek.folio",
+  "build": {
+    "beforeDevCommand": "python3 -m http.server 1420",
+    "beforeBuildCommand": "",
+    "devUrl": "http://127.0.0.1:1420",
+    "frontendDist": ".."
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Folio",
+        "width": 760,
+        "height": 560,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/icon.icns",
+      "icons/icon-mac-32x32.png",
+      "icons/icon-mac-128x128.png",
+      "icons/icon-mac-128x128@2x.png",
+      "icons/icon-mac-512x512.png",
+      "icons/icon-mac-512x512@2x.png"
+    ]
+  }
+}
